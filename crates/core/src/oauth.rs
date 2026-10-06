@@ -1,5 +1,6 @@
-//! OAuth 2.0 authorization code flow with PKCE for a public desktop client.
-//! The browser redirects to a loopback listener; no client secret exists.
+//! OAuth 2.0 authorization code flow with PKCE for a desktop client. The
+//! browser redirects to a loopback listener. Shared by every provider; the
+//! provider supplies endpoints and scopes through [`OAuthConfig`].
 
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -14,17 +15,29 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use url::Url;
 
+use crate::http::send_with_retry;
 use crate::token_store::TokenStore;
-use crate::{Error, Result, USER_AGENT};
-
-// v1 is personal accounts only, hence the `consumers` tenant.
-const AUTHORIZE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
-const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
-const SCOPES: &str = "Files.ReadWrite User.Read offline_access";
+use crate::{Error, ProviderKind, Result, USER_AGENT, UrlCallback};
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Refresh this long before the access token actually expires.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+pub struct OAuthConfig {
+    pub provider: ProviderKind,
+    pub authorize_url: &'static str,
+    pub token_url: &'static str,
+    pub client_id: String,
+    /// Some providers issue a "secret" even to desktop apps and require it
+    /// at the token endpoint. It is not confidential there.
+    pub client_secret: Option<String>,
+    pub scopes: &'static str,
+    /// Host part of the loopback redirect URI as the provider expects it,
+    /// `localhost` or `127.0.0.1`.
+    pub redirect_host: &'static str,
+    pub extra_authorize_params: &'static [(&'static str, &'static str)],
+}
 
 struct AccessToken {
     value: String,
@@ -47,18 +60,17 @@ struct TokenError {
 
 pub struct Authenticator {
     http: reqwest::Client,
-    client_id: String,
+    config: OAuthConfig,
     store: TokenStore,
     cached: Mutex<Option<AccessToken>>,
 }
 
 impl Authenticator {
-    pub fn new(client_id: impl Into<String>) -> Result<Self> {
-        let client_id = client_id.into();
+    pub fn new(config: OAuthConfig) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
-            store: TokenStore::new(client_id.clone()),
-            client_id,
+            store: TokenStore::new(config.provider, config.client_id.clone()),
+            config,
             cached: Mutex::new(None),
         })
     }
@@ -67,29 +79,33 @@ impl Authenticator {
         &self.http
     }
 
+    /// Whether a session is stored. It may still turn out to be revoked.
+    pub async fn is_signed_in(&self) -> Result<bool> {
+        Ok(self.store.load().await?.is_some())
+    }
+
     /// Interactive sign-in through the system browser. `on_url` receives the
     /// authorization URL so the caller can show it in case no browser opens.
-    pub async fn sign_in(&self, on_url: impl FnOnce(&str)) -> Result<()> {
+    pub async fn sign_in(&self, on_url: &UrlCallback) -> Result<()> {
+        let config = &self.config;
         let listeners = LoopbackListeners::bind().await?;
-        let redirect_uri = format!("http://localhost:{}", listeners.port);
+        let redirect_uri = format!("http://{}:{}", config.redirect_host, listeners.port);
         let verifier = random_token()?;
         let state = random_token()?;
+        let challenge = pkce_challenge(&verifier);
 
-        let url = Url::parse_with_params(
-            AUTHORIZE_URL,
-            &[
-                ("client_id", self.client_id.as_str()),
-                ("response_type", "code"),
-                ("redirect_uri", &redirect_uri),
-                ("response_mode", "query"),
-                ("scope", SCOPES),
-                ("state", &state),
-                ("code_challenge", &pkce_challenge(&verifier)),
-                ("code_challenge_method", "S256"),
-                ("prompt", "select_account"),
-            ],
-        )
-        .expect("static authorize URL is valid");
+        let mut params = vec![
+            ("client_id", config.client_id.as_str()),
+            ("response_type", "code"),
+            ("redirect_uri", &redirect_uri),
+            ("scope", config.scopes),
+            ("state", &state),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ];
+        params.extend_from_slice(config.extra_authorize_params);
+        let url = Url::parse_with_params(config.authorize_url, &params)
+            .expect("provider authorize URL is valid");
 
         on_url(url.as_str());
         // Best effort: the URL has already been handed to the caller.
@@ -105,19 +121,18 @@ impl Authenticator {
 
         let tokens = self
             .request_tokens(&[
-                ("client_id", self.client_id.as_str()),
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", &redirect_uri),
                 ("code_verifier", &verifier),
-                ("scope", SCOPES),
             ])
             .await
             .map_err(|e| match e {
                 Error::SessionExpired(msg) => Error::SignIn(msg),
                 other => other,
             })?;
-        self.accept(tokens).await
+        let mut cached = self.cached.lock().await;
+        self.store_tokens(&mut cached, tokens).await
     }
 
     pub async fn sign_out(&self) -> Result<()> {
@@ -138,10 +153,8 @@ impl Authenticator {
         let refresh_token = self.store.load().await?.ok_or(Error::NotSignedIn)?;
         let tokens = self
             .request_tokens(&[
-                ("client_id", self.client_id.as_str()),
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh_token),
-                ("scope", SCOPES),
             ])
             .await?;
         let value = tokens.access_token.clone();
@@ -150,14 +163,9 @@ impl Authenticator {
     }
 
     /// Drop the cached access token, forcing a refresh on next use. Called
-    /// when Graph answers 401 for a token we believed valid.
+    /// when the API answers 401 for a token we believed valid.
     pub async fn invalidate(&self) {
         *self.cached.lock().await = None;
-    }
-
-    async fn accept(&self, tokens: TokenResponse) -> Result<()> {
-        let mut cached = self.cached.lock().await;
-        self.store_tokens(&mut cached, tokens).await
     }
 
     async fn store_tokens(
@@ -165,7 +173,7 @@ impl Authenticator {
         cached: &mut Option<AccessToken>,
         tokens: TokenResponse,
     ) -> Result<()> {
-        // Each response may rotate the refresh token; the old one must be
+        // A response may rotate the refresh token; the old one must then be
         // replaced or the session eventually dies.
         if let Some(refresh_token) = &tokens.refresh_token {
             self.store.save(refresh_token).await?;
@@ -177,15 +185,25 @@ impl Authenticator {
         Ok(())
     }
 
-    async fn request_tokens(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
-        let response = self.http.post(TOKEN_URL).form(form).send().await?;
+    async fn request_tokens(&self, grant: &[(&str, &str)]) -> Result<TokenResponse> {
+        let config = &self.config;
+        let mut form = vec![
+            ("client_id", config.client_id.as_str()),
+            ("scope", config.scopes),
+        ];
+        if let Some(secret) = &config.client_secret {
+            form.push(("client_secret", secret));
+        }
+        form.extend_from_slice(grant);
+
+        let response = send_with_retry(|| self.http.post(config.token_url).form(&form)).await?;
         let status = response.status();
         let body = response.text().await?;
         if status.is_success() {
             return Ok(serde_json::from_str(&body)?);
         }
         match serde_json::from_str::<TokenError>(&body) {
-            // Anything the identity platform reports at 400 means this grant
+            // Anything the identity service reports at 400 means this grant
             // is unusable; only the user can fix it by signing in again.
             Ok(err) if status == reqwest::StatusCode::BAD_REQUEST => Err(Error::SessionExpired(
                 format!("{}: {}", err.error, first_line(&err.error_description)),
@@ -278,7 +296,7 @@ async fn read_request_line(stream: &mut TcpStream) -> Option<String> {
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, message: &str) {
-    let body = format!("<!doctype html><meta charset=utf-8><title>odl</title><p>{message}</p>");
+    let body = format!("<!doctype html><meta charset=utf-8><title>skydock</title><p>{message}</p>");
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()

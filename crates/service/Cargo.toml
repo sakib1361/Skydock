@@ -1,0 +1,17 @@
+[package]
+name = "skydock-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+skydock-core = { version = "0.1.0", path = "../core" }
+skydock-gdrive = { version = "0.1.0", path = "../gdrive" }
+skydock-onedrive = { version = "0.1.0", path = "../onedrive" }
+skydock-state = { version = "0.1.0", path = "../state" }
+skydock-vfs = { version = "0.1.0", path = "../vfs" }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt"] }
+toml = "1.1.6"

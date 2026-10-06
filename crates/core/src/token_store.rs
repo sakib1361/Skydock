@@ -1,24 +1,27 @@
 use std::collections::HashMap;
 
-use crate::Result;
+use crate::{ProviderKind, Result};
 
 /// Persists the refresh token in the desktop keyring (Secret Service, which
 /// KWallet provides on Plasma). The token never touches a plain file.
 pub struct TokenStore {
+    provider: ProviderKind,
     client_id: String,
 }
 
 impl TokenStore {
-    pub fn new(client_id: impl Into<String>) -> Self {
+    pub fn new(provider: ProviderKind, client_id: impl Into<String>) -> Self {
         Self {
+            provider,
             client_id: client_id.into(),
         }
     }
 
     fn attributes(&self) -> HashMap<&str, &str> {
         HashMap::from([
-            ("application", "odl"),
+            ("application", "skydock"),
             ("kind", "refresh-token"),
+            ("provider", self.provider.id()),
             ("client-id", self.client_id.as_str()),
         ])
     }
@@ -47,7 +50,7 @@ impl TokenStore {
         Self::keyring()
             .await?
             .create_item(
-                "odl OneDrive sign-in",
+                &format!("Skydock {} sign-in", self.provider.display_name()),
                 &self.attributes(),
                 refresh_token,
                 true,

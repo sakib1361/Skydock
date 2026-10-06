@@ -10,11 +10,11 @@ CMakeFiles/
 CMakeUserPresets.json
 compile_commands.json
 
-# Packaging output
+# Packaging output (scripts/package.sh)
+/out/
 *.deb
 *.AppImage
 *.AppImage.zsync
-/dist/
 
 # Local configuration and secrets
 .env
@@ -32,17 +32,17 @@ compile_commands.json
 *.log
 
 # Editors and IDEs
-.vscode/*
-!.vscode/extensions.json
-!.vscode/settings.json
+.vscode
 .idea/
 *.swp
 *.swo
 *~
 .directory
 
-# Claude Code local settings
-.claude/settings.local.json
+# AI assistant files (kept local, not part of the published project)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
 
 # OS
 .DS_Store

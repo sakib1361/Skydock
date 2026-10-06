@@ -1,0 +1,451 @@
+import { AboutSlint, Button, ComboBox, LineEdit, Palette, ProgressIndicator, Spinner } from "std-widgets.slint";
+
+export struct ProviderRow {
+    id: string,
+    name: string,
+    icon: image,
+    configured: bool,
+    // Setting this provider up takes a client secret as well as an ID.
+    needs-secret: bool,
+    signed-in: bool,
+    headline: string,
+    detail: string,
+    storage: string,
+    // Share of the quota in use, negative when unknown.
+    storage-fraction: float,
+    folder: string,
+    // How much of the drive has been downloaded, as a sentence.
+    on-device: string,
+    // "Last checked 2 min ago"; empty until the first check.
+    last-checked: string,
+    busy: bool,
+    busy-text: string,
+    error: string,
+}
+
+component ProviderCard inherits Rectangle {
+    in property <ProviderRow> data;
+    callback sign-in();
+    callback sign-out();
+    callback sync-now();
+    callback open-folder();
+    callback save-credentials(string, string);
+    property <string> client-id;
+    property <string> client-secret;
+
+    background: Palette.alternate-background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 16px;
+
+        VerticalLayout {
+            alignment: start;
+            Image {
+                source: root.data.icon;
+                width: 56px;
+                height: 56px;
+                image-fit: contain;
+            }
+        }
+
+        VerticalLayout {
+            alignment: start;
+            spacing: 6px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.data.name;
+                font-size: 16px;
+                font-weight: 600;
+            }
+
+            Text {
+                text: root.data.headline;
+                wrap: word-wrap;
+            }
+
+            if root.data.detail != "": Text {
+                text: root.data.detail;
+                wrap: word-wrap;
+                opacity: 0.7;
+            }
+
+            if !root.data.configured: LineEdit {
+                placeholder-text: "Client ID";
+                edited(text) => {
+                    root.client-id = text;
+                }
+            }
+
+            if !root.data.configured && root.data.needs-secret: LineEdit {
+                placeholder-text: "Client secret";
+                edited(text) => {
+                    root.client-secret = text;
+                }
+            }
+
+            if root.data.storage-fraction >= 0: ProgressIndicator {
+                progress: root.data.storage-fraction;
+            }
+
+            if root.data.storage != "": Text {
+                text: root.data.storage;
+                font-size: 12px;
+                opacity: 0.7;
+            }
+
+            if root.data.signed-in: Text {
+                text: root.data.folder;
+                font-size: 12px;
+                overflow: elide;
+                opacity: 0.7;
+            }
+
+            if root.data.signed-in && root.data.on-device != "": Text {
+                text: root.data.on-device;
+                font-size: 12px;
+                opacity: 0.7;
+            }
+
+            if root.data.busy: HorizontalLayout {
+                alignment: start;
+                spacing: 8px;
+                Spinner {
+                    indeterminate: true;
+                    width: 18px;
+                    height: 18px;
+                }
+
+                Text {
+                    text: root.data.busy-text;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.data.error != "": Text {
+                text: root.data.error;
+                wrap: word-wrap;
+                color: #d9534f;
+            }
+        }
+
+        VerticalLayout {
+            alignment: start;
+            spacing: 8px;
+
+            if !root.data.configured: Button {
+                text: "Save";
+                primary: true;
+                enabled: !root.data.busy && root.client-id != "" && (!root.data.needs-secret || root.client-secret != "");
+                clicked => {
+                    root.save-credentials(root.client-id, root.client-secret);
+                }
+            }
+
+            if root.data.configured && !root.data.signed-in: Button {
+                text: "Sign in";
+                primary: true;
+                enabled: !root.data.busy;
+                clicked => {
+                    root.sign-in();
+                }
+            }
+
+            if root.data.signed-in: Button {
+                text: "Check for changes";
+                primary: true;
+                enabled: !root.data.busy;
+                clicked => {
+                    root.sync-now();
+                }
+            }
+
+            if root.data.signed-in && root.data.last-checked != "": Text {
+                text: root.data.last-checked;
+                font-size: 11px;
+                opacity: 0.7;
+                horizontal-alignment: center;
+            }
+
+            if root.data.signed-in: Button {
+                text: "Open folder";
+                clicked => {
+                    root.open-folder();
+                }
+            }
+
+            if root.data.signed-in: Button {
+                text: "Sign out";
+                enabled: !root.data.busy;
+                clicked => {
+                    root.sign-out();
+                }
+            }
+        }
+    }
+}
+
+component SectionTitle inherits Text {
+    font-weight: 600;
+}
+
+component Hint inherits Text {
+    font-size: 12px;
+    opacity: 0.7;
+    wrap: word-wrap;
+}
+
+export component MainWindow inherits Window {
+    in property <[ProviderRow]> providers;
+    in property <string> sync-root;
+    in property <string> message;
+    in property <string> version;
+    // Position in `check-choices` of the saved setting.
+    in-out property <int> check-interval-index;
+    in-out property <bool> show-settings;
+    callback sign-in(string);
+    callback sign-out(string);
+    callback sync-now(string);
+    callback open-folder(string);
+    callback save-credentials(string, string, string);
+    callback choose-folder();
+    callback check-interval-changed(int);
+    callback free-up-space(string);
+
+    // Must match CHECK_INTERVALS_MINUTES in main.rs.
+    property <[string]> check-choices: [
+        "Every minute",
+        "Every 5 minutes",
+        "Every 15 minutes",
+        "Every 30 minutes",
+        "Every hour",
+        "Only when I ask",
+    ];
+
+    title: "Skydock";
+    icon: @image-url("../../../packaging/skydock.svg");
+    preferred-width: 660px;
+    preferred-height: 520px;
+    min-width: 540px;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 16px;
+
+        HorizontalLayout {
+            Text {
+                text: root.show-settings ? "Settings" : "Skydock";
+                font-size: 22px;
+                font-weight: 600;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+
+            Button {
+                text: root.show-settings ? "Back" : "Settings";
+                clicked => {
+                    root.show-settings = !root.show-settings;
+                }
+            }
+        }
+
+        if !root.show-settings: VerticalLayout {
+            spacing: 16px;
+
+            for entry in root.providers: ProviderCard {
+                data: entry;
+                sign-in => {
+                    root.sign-in(entry.id);
+                }
+                sign-out => {
+                    root.sign-out(entry.id);
+                }
+                sync-now => {
+                    root.sync-now(entry.id);
+                }
+                open-folder => {
+                    root.open-folder(entry.id);
+                }
+                save-credentials(client-id, client-secret) => {
+                    root.save-credentials(entry.id, client-id, client-secret);
+                }
+            }
+        }
+
+        if root.show-settings: VerticalLayout {
+            spacing: 20px;
+
+            HorizontalLayout {
+                spacing: 12px;
+
+                VerticalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+
+                    SectionTitle {
+                        text: "Sync folder";
+                    }
+
+                    Text {
+                        text: root.sync-root;
+                        overflow: elide;
+                    }
+
+                    Hint {
+                        text: "Each account gets its own folder inside it. Keep it inside your home folder.";
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        Button {
+                            text: "Change…";
+                            clicked => {
+                                root.choose-folder();
+                            }
+                        }
+
+                        Tooltip {
+                            text: @markdown("Choose a folder inside your **home folder**.\n\nYour drives appear in it as on-demand folders. Ubuntu only allows those under your home folder, /mnt or /media, not on external drives (/run/media).\n\nThe folder itself uses no disk space. Files you open are kept in ~/.cache/skydock.");
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+
+                VerticalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+
+                    SectionTitle {
+                        text: "Check for changes";
+                    }
+
+                    Hint {
+                        text: "How often Skydock asks each drive what has changed. Files are never downloaded by a check.";
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    ComboBox {
+                        model: root.check-choices;
+                        current-index <=> root.check-interval-index;
+                        selected => {
+                            root.check-interval-changed(self.current-index);
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: 8px;
+
+                SectionTitle {
+                    text: "On this device";
+                }
+
+                Hint {
+                    text: "Free up space removes downloaded copies from this computer only. Nothing is deleted from the cloud, and a file downloads again when you open it.";
+                }
+
+                for entry in root.providers: HorizontalLayout {
+                    spacing: 12px;
+
+                    Text {
+                        text: entry.name;
+                        vertical-alignment: center;
+                        min-width: 110px;
+                    }
+
+                    Text {
+                        text: entry.signed-in ? entry.on-device : "Not signed in";
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        opacity: 0.7;
+                        overflow: elide;
+                    }
+
+                    Button {
+                        text: "Free up space";
+                        enabled: entry.signed-in;
+                        clicked => {
+                            root.free-up-space(entry.id);
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+
+                VerticalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+                    alignment: center;
+
+                    SectionTitle {
+                        text: "About";
+                    }
+
+                    Hint {
+                        text: "Skydock " + root.version + " · MIT licence · not affiliated with Microsoft or Google";
+                    }
+                }
+
+                AboutSlint {
+                    width: 150px;
+                    height: 60px;
+                }
+            }
+        }
+
+        if root.message != "": Text {
+            text: root.message;
+            wrap: word-wrap;
+            color: #d9534f;
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+        }
+    }
+}
+
+export component TrayIcon inherits SystemTrayIcon {
+    in property <image> image: @image-url("../../../packaging/skydock.svg");
+    // One line per drive, kept current by main.rs.
+    in property <string> status: "Skydock";
+    callback open();
+    callback quit();
+
+    icon: root.image;
+    title: "Skydock";
+    tooltip: root.status;
+    clicked => {
+        root.open();
+    }
+
+    Menu {
+        MenuItem {
+            title: "Open Skydock";
+            activated => {
+                root.open();
+            }
+        }
+
+        MenuItem {
+            title: "Quit";
+            activated => {
+                root.quit();
+            }
+        }
+    }
+}

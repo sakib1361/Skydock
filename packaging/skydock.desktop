@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Skydock
+GenericName=Cloud Drive Client
+Comment=Sync OneDrive and Google Drive
+Exec=skydock-gui
+Icon=skydock
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=cloud;sync;onedrive;google drive;

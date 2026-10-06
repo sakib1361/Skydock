@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -5,22 +6,24 @@ use reqwest::header::RETRY_AFTER;
 use reqwest::{Response, StatusCode};
 use serde::de::DeserializeOwned;
 
-use crate::model::Drive;
-use crate::{Authenticator, Error, Result};
+use tokio::io::AsyncWriteExt;
 
-pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+use crate::hash::{HashKind, Hasher};
+use crate::oauth::Authenticator;
+use crate::{Downloaded, Error, Result};
 
 const MAX_THROTTLE_ATTEMPTS: u32 = 5;
 
-pub struct GraphClient {
+/// Authenticated HTTP access to a provider API, shared by all providers.
+pub struct ApiClient {
     auth: Authenticator,
     /// While set and in the future, no request may be sent. Shared by all
-    /// callers because Graph expects every request to stop when one is
+    /// callers because providers expect every request to stop when one is
     /// throttled, and throttled requests still count against the quota.
     pause_until: Mutex<Option<Instant>>,
 }
 
-impl GraphClient {
+impl ApiClient {
     pub fn new(auth: Authenticator) -> Self {
         Self {
             auth,
@@ -32,11 +35,7 @@ impl GraphClient {
         &self.auth
     }
 
-    pub async fn my_drive(&self) -> Result<Drive> {
-        self.get_json(&format!("{GRAPH_BASE}/me/drive")).await
-    }
-
-    pub(crate) async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+    pub async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         let response = self.get(url).await?;
         let status = response.status();
         let body = response.text().await?;
@@ -46,15 +45,42 @@ impl GraphClient {
         Ok(serde_json::from_str(&body)?)
     }
 
+    /// Stream the body of an authenticated GET into `dest`, hashing it on
+    /// the way. Redirects to pre-authenticated download hosts are followed
+    /// without the `Authorization` header, which the HTTP client drops when
+    /// the host changes.
+    pub async fn download(&self, url: &str, dest: &Path, kind: HashKind) -> Result<Downloaded> {
+        let mut response = self.get(url).await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(Error::Api { status, body });
+        }
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut hasher = Hasher::new(kind);
+        let mut bytes = 0;
+        while let Some(chunk) = response.chunk().await? {
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+            bytes += chunk.len() as u64;
+        }
+        file.flush().await?;
+        Ok(Downloaded {
+            bytes,
+            hash: hasher.finish(),
+        })
+    }
+
     /// Authenticated GET. Handles throttling and one token refresh on 401;
     /// every other status is returned to the caller.
-    pub(crate) async fn get(&self, url: &str) -> Result<Response> {
+    pub async fn get(&self, url: &str) -> Result<Response> {
         let mut refreshed = false;
         let mut throttled = 0;
         loop {
             self.wait_for_pause().await;
             let token = self.auth.access_token().await?;
-            let response = self.auth.http().get(url).bearer_auth(token).send().await?;
+            let response =
+                send_with_retry(|| self.auth.http().get(url).bearer_auth(&token)).await?;
 
             match response.status() {
                 StatusCode::UNAUTHORIZED if !refreshed => {
@@ -94,6 +120,29 @@ impl GraphClient {
                 }
                 _ => return,
             }
+        }
+    }
+}
+
+const NETWORK_ATTEMPTS: u32 = 3;
+
+/// Send a request, trying again when the connection itself fails (reset,
+/// refused, timed out). These are common on long sessions and say nothing
+/// about the request; HTTP error statuses are returned as responses.
+pub(crate) async fn send_with_retry(
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> std::result::Result<Response, reqwest::Error> {
+    let mut attempt = 1;
+    loop {
+        match build().send().await {
+            Err(error)
+                if attempt < NETWORK_ATTEMPTS
+                    && (error.is_connect() || error.is_timeout() || error.is_request()) =>
+            {
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            result => return result,
         }
     }
 }

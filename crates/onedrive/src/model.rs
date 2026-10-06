@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use skydock_core::{Change, RemoteItem};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -11,6 +12,14 @@ pub struct Drive {
     pub id: String,
     pub drive_type: Option<String>,
     pub quota: Option<Quota>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct User {
+    pub display_name: Option<String>,
+    pub user_principal_name: Option<String>,
+    pub mail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,6 +67,40 @@ impl DriveItem {
             .as_ref()?
             .quick_xor_hash
             .as_deref()
+    }
+
+    /// Provider-neutral form. `None` for entries that cannot be placed in
+    /// the tree (no name, or no parent and not the root).
+    pub fn into_change(self) -> Option<Change> {
+        if self.is_deleted() {
+            return Some(Change::Delete { id: self.id });
+        }
+        let is_root = self.root.is_some();
+        let parent_id = self.parent_reference.as_ref().and_then(|p| p.id.clone());
+        if !is_root && parent_id.is_none() {
+            return None;
+        }
+        // Shortcuts to folders in other drives carry no `folder` facet of
+        // their own; the facet sits inside `remoteItem`.
+        let is_folder = is_root
+            || self.is_folder()
+            || self
+                .remote_item
+                .as_ref()
+                .is_some_and(|remote| remote.get("folder").is_some());
+        let hash = self.quick_xor_hash().map(str::to_owned);
+        Some(Change::Upsert(RemoteItem {
+            id: self.id,
+            parent_id: if is_root { None } else { parent_id },
+            name: self.name?,
+            is_folder,
+            size: self.size,
+            version: self.e_tag,
+            hash,
+            modified: self
+                .file_system_info
+                .and_then(|info| info.last_modified_date_time),
+        }))
     }
 }
 
@@ -136,5 +179,45 @@ mod tests {
         assert!(item.is_file() && !item.is_folder());
         assert_eq!(item.c_tag.as_deref(), Some("c"));
         assert_eq!(item.quick_xor_hash(), Some("aGVsbG8="));
+    }
+
+    fn item(json: serde_json::Value) -> DriveItem {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn deleted_entry_becomes_a_delete() {
+        let change = item(serde_json::json!({ "id": "x", "deleted": {} })).into_change();
+        assert_eq!(change, Some(Change::Delete { id: "x".to_owned() }));
+    }
+
+    #[test]
+    fn root_has_no_parent_and_is_a_folder() {
+        let change = item(serde_json::json!({
+            "id": "r", "name": "root", "root": {}, "parentReference": { "id": "ignored" }
+        }))
+        .into_change();
+        let Some(Change::Upsert(root)) = change else {
+            panic!("expected upsert")
+        };
+        assert!(root.is_folder && root.parent_id.is_none());
+    }
+
+    #[test]
+    fn shared_folder_shortcut_counts_as_a_folder() {
+        let change = item(serde_json::json!({
+            "id": "s", "name": "Shared", "parentReference": { "id": "r" },
+            "remoteItem": { "id": "other", "folder": {} }
+        }))
+        .into_change();
+        assert!(matches!(change, Some(Change::Upsert(item)) if item.is_folder));
+    }
+
+    #[test]
+    fn entries_without_name_or_parent_are_dropped() {
+        let nameless = item(serde_json::json!({ "id": "a", "parentReference": { "id": "r" } }));
+        let orphan = item(serde_json::json!({ "id": "b", "name": "b" }));
+        assert_eq!(nameless.into_change(), None);
+        assert_eq!(orphan.into_change(), None);
     }
 }

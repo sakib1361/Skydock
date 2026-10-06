@@ -1,0 +1,16 @@
+[package]
+name = "skydock-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libm = "0.2.16"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+skydock-core = { version = "0.1.0", path = "../core" }
+skydock-service = { version = "0.1.0", path = "../service" }
+slint = "1.18.1"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "process", "time", "signal"] }
+
+[build-dependencies]
+slint-build = "1.18.1"

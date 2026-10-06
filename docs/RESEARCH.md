@@ -2,17 +2,19 @@
 
 Gathered 2026-10-06. Items marked **(unverified)** come from memory or a search snippet rather than a primary source read in full; check them before relying on them.
 
-## 1. Existing clients (why build another)
+## 1. Inspired by
 
-| Project | Stack | On-demand | State | Gap |
-|---|---|---|---|---|
-| [abraunegg/onedrive](https://github.com/abraunegg/onedrive) | D, CLI daemon, GPLv3 | No (listed under "What's missing") | Mature; delta, WebSocket notifications, shared folders, Business, national clouds | Full/selective mirror only; GUI is a separate project (OneDriveGUI) |
-| [jstaf/onedriver](https://github.com/jstaf/onedriver) | Go, FUSE, GPLv3 | Yes | Packaged for Fedora/openSUSE/Arch/Nix | Loads large files into memory; file-manager thumbnails trigger bulk downloads; offline is read-only |
-| [franzjeger/OneDriveForLinux](https://github.com/franzjeger/OneDriveForLinux) | Rust workspace, FUSE, MIT | Yes | 1 star, 66 commits; tarball + install script | Unproven; no deb/AppImage |
-| [kartas39/konedrive](https://github.com/kartas39/konedrive) | Rust daemon + Qt6/Kirigami, fanotify, GPLv3 | Yes | Alpha, read-only (uploads disabled), personal accounts only, RPM only | Needs a root helper; no Debian packaging |
-| rclone mount | Go | Cache-based | Mature | Not a sync client; no shell integration |
+Skydock builds on ideas from projects that came before it. Each of these was read while planning, and each shaped a decision.
 
-The last two Rust projects are the closest prior art and worth reading for design ideas. Their crate splits are nearly identical: graph client, sync engine (SQLite state), VFS, daemon (D-Bus), tray, CLI.
+| Project | Approach | What Skydock takes from it |
+|---|---|---|
+| [abraunegg/onedrive](https://github.com/abraunegg/onedrive) | D, command-line sync daemon, GPLv3 | The reference for correct OneDrive sync: delta handling, WebSocket change notifications, shared folders, and its documentation of Graph API quirks |
+| [jstaf/onedriver](https://github.com/jstaf/onedriver) | Go, FUSE, GPLv3 | Showed that a FUSE mount gives files on demand on Linux without root, and what to watch for with thumbnails and large files |
+| [franzjeger/OneDriveForLinux](https://github.com/franzjeger/OneDriveForLinux) | Rust workspace, FUSE, MIT | The crate layout (API client, sync engine, filesystem, daemon, tray, CLI) and exposing sync state to Dolphin through an extended attribute |
+| [kartas39/konedrive](https://github.com/kartas39/konedrive) | Rust daemon with a Qt6/Kirigami window, fanotify, GPLv3 | The fanotify pre-content approach as an alternative to FUSE, keeping tokens in the desktop keyring, and a window that talks to the daemon over D-Bus |
+| [rclone](https://rclone.org/onedrive/) | Go, mount with a local cache | Letting users supply their own client ID, and its long experience with both providers' APIs |
+
+Where Skydock aims to differ is in combination, not in any single idea: files on demand, more than one provider, a desktop window, and `.deb` and AppImage packages together.
 
 ## 2. Authentication (Microsoft identity platform v2)
 
@@ -138,7 +140,7 @@ Common problems either way:
 | D-Bus / tray | `zbus`, `ksni` | `Tmds.DBus` | `dbus-next` |
 | Graph | Hand-rolled REST over `reqwest` (small surface) | Official Graph SDK + MSAL | `msal` + REST |
 | Packaging | `cargo-deb`, AppImage straightforward | Self-contained publish is large | Hardest to make a clean deb/AppImage |
-| Prior art | Both recent on-demand clients | None on Linux | Older, abandoned clients |
+| Prior art | Two recent on-demand clients | None found on Linux | Earlier sync clients |
 
 Recommendation: Rust for daemon, VFS and CLI. The needed Graph surface is about a dozen endpoints, so the lack of an official SDK costs little, while FUSE quality and package size matter a lot. The Dolphin plugins are C++ regardless of the core language.
 

@@ -2,16 +2,6 @@ use reqwest::StatusCode;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// How to reconcile local state after the service rejected a delta token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResyncKind {
-    /// Server wins for items known to be in sync; upload local-only changes.
-    ApplyDifferences,
-    /// Upload anything the server did not return or that differs, keeping
-    /// both copies when unsure.
-    UploadDifferences,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("not signed in")]
@@ -27,11 +17,11 @@ pub enum Error {
     #[error("session expired, sign in again: {0}")]
     SessionExpired(String),
 
-    /// HTTP 410 on delta. Re-enumerate from `location`, then reconcile.
-    #[error("delta token rejected, full resync required ({kind:?})")]
-    DeltaResync { location: String, kind: ResyncKind },
+    /// The provider has no client ID (or other required setting).
+    #[error("{0} is not configured")]
+    NotConfigured(String),
 
-    #[error("Graph returned {status}: {body}")]
+    #[error("the service returned {status}: {body}")]
     Api { status: StatusCode, body: String },
 
     #[error("still throttled after {0} attempts")]
