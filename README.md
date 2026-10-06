@@ -243,6 +243,20 @@ The AppImage step uses `appimagetool` from your `PATH`, or downloads the officia
 
 Packages target Ubuntu 24.04 and newer (glibc 2.39). The script checks this and stops if a binary would need something newer.
 
+### Releases
+
+[.github/workflows/release.yml](.github/workflows/release.yml) builds both packages on GitHub and publishes them as a release when a version tag is pushed:
+
+```sh
+# after setting the new version in Cargo.toml and committing it
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag must match the version in `Cargo.toml`. The release build takes the app registrations from the repository secrets `SKYDOCK_ONEDRIVE_CLIENT_ID`, `SKYDOCK_GDRIVE_CLIENT_ID` and `SKYDOCK_GDRIVE_CLIENT_SECRET` (Settings → Secrets and variables → Actions) and stops if one is missing.
+
+Running the workflow by hand from the Actions tab builds the same packages as a downloadable artifact without publishing a release.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

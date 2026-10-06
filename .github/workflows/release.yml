@@ -1,0 +1,98 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds the .deb and AppImage and publishes them as
+# a GitHub release. Running the workflow by hand builds the same packages and
+# keeps them as a workflow artifact, without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    # Ubuntu 24.04 has glibc 2.39, the oldest that scripts/package.sh supports.
+    # Building on anything newer would make the packages fail its glibc check.
+    runs-on: ubuntu-24.04
+    env:
+      SKYDOCK_ONEDRIVE_CLIENT_ID: ${{ secrets.SKYDOCK_ONEDRIVE_CLIENT_ID }}
+      SKYDOCK_GDRIVE_CLIENT_ID: ${{ secrets.SKYDOCK_GDRIVE_CLIENT_ID }}
+      SKYDOCK_GDRIVE_CLIENT_SECRET: ${{ secrets.SKYDOCK_GDRIVE_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the Cargo version
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+              exit 1
+          fi
+
+      # A published build without these would ask every user for a client ID.
+      - name: Check the app registrations are set
+        if: github.ref_type == 'tag'
+        run: |
+          missing=0
+          for name in SKYDOCK_ONEDRIVE_CLIENT_ID SKYDOCK_GDRIVE_CLIENT_ID SKYDOCK_GDRIVE_CLIENT_SECRET; do
+              if [ -z "${!name}" ]; then
+                  echo "::error::repository secret $name is not set"
+                  missing=1
+              fi
+          done
+          exit "$missing"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config libsqlite3-dev libfontconfig-dev fuse3 \
+              dpkg-dev binutils file curl
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # scripts/package.sh takes the .deb maintainer from git's identity,
+      # which a runner does not have. Use the author of the released commit.
+      - name: Set the package maintainer
+        run: |
+          git config user.name "$(git log -1 --format=%an)"
+          git config user.email "$(git log -1 --format=%ae)"
+
+      - name: Build packages
+        run: scripts/package.sh
+
+      - name: Collect packages
+        run: |
+          mkdir dist
+          cp out/*.deb out/*.AppImage dist/
+          cd dist
+          sha256sum * > SHA256SUMS
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skydock-packages
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "Skydock ${GITHUB_REF_NAME#v}" \
+              --generate-notes \
+              --verify-tag
