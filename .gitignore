@@ -1,0 +1,50 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# CMake (Dolphin plugins, later)
+build/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+
+# Packaging output
+*.deb
+*.AppImage
+*.AppImage.zsync
+/dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local runtime data (never keep sync state or tokens in the repo)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.log
+
+# Editors and IDEs
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.directory
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+.Trash-*/
