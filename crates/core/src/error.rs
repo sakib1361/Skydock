@@ -24,6 +24,10 @@ pub enum Error {
     #[error("the service returned {status}: {body}")]
     Api { status: StatusCode, body: String },
 
+    /// The remote content is no longer the one the caller started from.
+    #[error("the item was changed by someone else")]
+    Conflict,
+
     #[error("still throttled after {0} attempts")]
     Throttled(u32),
 
@@ -38,6 +42,21 @@ pub enum Error {
 
     #[error("keyring: {0}")]
     Keyring(String),
+}
+
+impl Error {
+    /// HTTP status of the provider's answer, if this is one.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } => Some(status.as_u16()),
+            _ => None,
+        }
+    }
+
+    /// The provider does not have the item the request named.
+    pub fn is_not_found(&self) -> bool {
+        self.status() == Some(404)
+    }
 }
 
 // Kept as text: `oo7::Error` is large enough to bloat every `Result`.

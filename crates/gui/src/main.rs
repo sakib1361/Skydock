@@ -189,7 +189,7 @@ impl App {
                     totals: None,
                 });
                 self.update_row(kind, move |row| signed_in.apply(row));
-                self.pull(&service, kind, "Reading your files").await?;
+                self.first_read(&service, kind).await?;
             }
             Action::SignOut => {
                 self.mounts.lock().unwrap().remove(&kind);
@@ -197,7 +197,13 @@ impl App {
             }
             Action::Sync => self.pull(&service, kind, "Checking for changes").await?,
         }
-        let status = service.status(kind).await?;
+        let mut status = service.status(kind).await?;
+        let never_finished = matches!(&status, ProviderStatus::SignedIn { totals: None, .. });
+        if never_finished && matches!(action, Action::Refresh) {
+            // An earlier first read was cut short; pick it up again.
+            self.first_read(&service, kind).await?;
+            status = service.status(kind).await?;
+        }
         let ready = matches!(
             &status,
             ProviderStatus::SignedIn {
@@ -210,6 +216,22 @@ impl App {
             state.warning = format!("Files are not available in the folder: {error}");
         }
         Ok(state)
+    }
+
+    /// Read a drive for the first time: its top folder at once, so it can
+    /// be opened and browsed, then everything else behind it.
+    async fn first_read(
+        &self,
+        service: &Service,
+        kind: ProviderKind,
+    ) -> skydock_service::Result<()> {
+        self.set_busy(kind, "Reading your files…");
+        // If this fails the full read below still runs, and reports why.
+        if let Ok(true) = service.pull_top_level(kind).await {
+            let _ = self.ensure_mounted(service, kind).await;
+        }
+        self.pull(service, kind, "Folder is ready; still reading your files")
+            .await
     }
 
     /// Present the drive in its folder as files on demand.
@@ -226,11 +248,16 @@ impl App {
         Ok(())
     }
 
-    /// What the card says about downloaded content; empty if unknown.
+    /// What the card says about downloaded content and changes waiting to
+    /// be uploaded; empty if unknown.
     fn on_device_text(&self, kind: ProviderKind) -> String {
         Service::load()
-            .and_then(|service| service.on_device(kind))
-            .map(on_device_text)
+            .and_then(|service| {
+                Ok(on_device_text(
+                    service.on_device(kind)?,
+                    service.waiting_uploads(kind)?,
+                ))
+            })
             .unwrap_or_default()
     }
 
@@ -365,11 +392,16 @@ fn card_state(status: ProviderStatus) -> CardState {
     state
 }
 
-fn on_device_text(usage: CacheUsage) -> String {
-    match usage.files {
+fn on_device_text(usage: CacheUsage, waiting_uploads: usize) -> String {
+    let downloaded = match usage.files {
         0 => "Nothing downloaded to this device".to_owned(),
         1 => format!("1 file on this device · {}", human_size(usage.bytes)),
         files => format!("{files} files on this device · {}", human_size(usage.bytes)),
+    };
+    match waiting_uploads {
+        0 => downloaded,
+        1 => format!("{downloaded} · 1 file waiting to upload"),
+        files => format!("{downloaded} · {files} files waiting to upload"),
     }
 }
 
@@ -495,6 +527,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             name: kind.display_name().into(),
             icon: provider_icon(kind),
             needs_secret: kind == ProviderKind::GoogleDrive,
+            // Known without asking anyone, so the credential fields never
+            // flash up while the first status check is still running.
+            configured: service.is_configured(kind),
             storage_fraction: -1.0,
             ..Default::default()
         })
@@ -674,12 +709,33 @@ mod tests {
 
     #[test]
     fn on_device_line_handles_none_one_and_many() {
-        let text = |files, bytes| on_device_text(CacheUsage { files, bytes });
+        let text = |files, bytes| on_device_text(CacheUsage { files, bytes }, 0);
         assert_eq!(text(0, 0), "Nothing downloaded to this device");
         assert_eq!(text(1, 512), "1 file on this device · 512 B");
         assert_eq!(
             text(38, 3 * 1024 * 1024),
             "38 files on this device · 3.0 MiB"
+        );
+    }
+
+    #[test]
+    fn on_device_line_mentions_files_waiting_to_upload() {
+        let text = |waiting| {
+            on_device_text(
+                CacheUsage {
+                    files: 1,
+                    bytes: 512,
+                },
+                waiting,
+            )
+        };
+        assert_eq!(
+            text(1),
+            "1 file on this device · 512 B · 1 file waiting to upload"
+        );
+        assert_eq!(
+            text(4),
+            "1 file on this device · 512 B · 4 files waiting to upload"
         );
     }
 

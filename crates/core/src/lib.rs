@@ -139,11 +139,34 @@ pub type UrlCallback = dyn for<'a> Fn(&'a str) + Send + Sync;
 /// Receives the number of entries fetched so far during a long enumeration.
 pub type ProgressCallback = dyn Fn(usize) + Send + Sync;
 
+/// Receives each batch of changes as it arrives, before the set they
+/// belong to is complete. Only the finished [`ChangeSet`] is authoritative.
+pub type PageCallback<'a> = dyn Fn(&[Change]) + Send + Sync + 'a;
+
 /// A finished download: what was written and its hash as computed locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Downloaded {
     pub bytes: u64,
     pub hash: String,
+}
+
+/// Where uploaded content goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadTarget<'a> {
+    /// A new file in the folder `parent_id`. If the name is already taken
+    /// there the provider keeps both and returns the name it chose.
+    New { parent_id: &'a str, name: &'a str },
+    /// New content for an existing file, prepared on top of the remote
+    /// content whose hash is `base_hash`. If the remote content is no
+    /// longer that, the upload fails with [`Error::Conflict`] so somebody
+    /// else's edit is never overwritten. `base_version` is the
+    /// [`RemoteItem::version`] seen with that content; it lets the provider
+    /// check without an extra request.
+    Replace {
+        item_id: &'a str,
+        base_version: Option<&'a str>,
+        base_hash: Option<&'a str>,
+    },
 }
 
 #[async_trait]
@@ -163,8 +186,12 @@ pub trait Provider: Send + Sync {
     /// Remote changes since `cursor`, or the whole drive when `cursor` is
     /// `None`. If the provider rejects the cursor, the implementation falls
     /// back to a full enumeration and says so through [`ChangeSet::full`].
-    async fn changes(&self, cursor: Option<&str>, progress: &ProgressCallback)
-    -> Result<ChangeSet>;
+    async fn changes(&self, cursor: Option<&str>, on_page: &PageCallback<'_>) -> Result<ChangeSet>;
+
+    /// The drive's root folder followed by what is directly in it. A few
+    /// requests at most, so a drive can be shown before [`Self::changes`]
+    /// has read all of it.
+    async fn top_level(&self) -> Result<Vec<RemoteItem>>;
 
     /// The algorithm behind [`RemoteItem::hash`] for this provider.
     fn hash_kind(&self) -> HashKind;
@@ -172,6 +199,32 @@ pub trait Provider: Send + Sync {
     /// Write an item's content to `dest`, replacing it. The caller compares
     /// the returned hash with the one it expects; this only transfers.
     async fn download(&self, item_id: &str, dest: &Path) -> Result<Downloaded>;
+
+    /// Whether the provider can store a file or folder under this name.
+    fn accepts_name(&self, name: &str) -> bool;
+
+    /// Whether names differing only in letter case can share a folder.
+    fn names_are_case_sensitive(&self) -> bool;
+
+    /// Send the content of the local file `source` and return the item as
+    /// the provider now describes it.
+    async fn upload(&self, target: UploadTarget<'_>, source: &Path) -> Result<RemoteItem>;
+
+    /// Fails if the folder already holds something called `name`.
+    async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem>;
+
+    /// Rename an item, move it to another folder, or both.
+    async fn move_item(
+        &self,
+        item_id: &str,
+        from_parent_id: &str,
+        to_parent_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem>;
+
+    /// Move an item to the provider's recycle bin; a folder goes with its
+    /// contents. An item that is already gone is not an error.
+    async fn delete(&self, item_id: &str) -> Result<()>;
 }
 
 /// Collapse changes to one entry per item. An item can appear more than once

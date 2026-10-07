@@ -2,32 +2,63 @@
 
 mod delta;
 pub mod model;
+mod upload;
 
 use std::path::Path;
 
 use async_trait::async_trait;
-use skydock_core::http::ApiClient;
+use reqwest::StatusCode;
+use serde_json::json;
+use skydock_core::http::{ApiClient, read_json};
 use skydock_core::oauth::{Authenticator, OAuthConfig};
 use skydock_core::{
-    Account, ChangeSet, Downloaded, Error, HashKind, ProgressCallback, Provider, ProviderKind,
-    Result, UrlCallback,
+    Account, Change, ChangeSet, Downloaded, Error, HashKind, PageCallback, Provider, ProviderKind,
+    RemoteItem, Result, UploadTarget, UrlCallback,
 };
 
 use crate::delta::{DeltaLink, Page};
-use crate::model::{Drive, User, normalize_drive_id};
+use crate::model::{Drive, DriveItem, User, normalize_drive_id};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
 /// Only what `DriveItem` reads, in large pages: the full enumeration of a
 /// big drive is otherwise dominated by payload we throw away.
-const DELTA_QUERY: &str = "$top=1000&$select=id,name,size,eTag,cTag,parentReference,\
-                           fileSystemInfo,file,folder,root,deleted,remoteItem";
+const ITEM_QUERY: &str = "$top=1000&$select=id,name,size,eTag,cTag,parentReference,\
+                          fileSystemInfo,file,folder,root,deleted,remoteItem";
+
+/// One page of a folder's children.
+#[derive(serde::Deserialize)]
+struct Children {
+    #[serde(default)]
+    value: Vec<DriveItem>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
 
 pub struct OneDrive {
     api: ApiClient,
 }
 
 impl OneDrive {
+    /// The current version of the file `target` replaces, if its content is
+    /// still the one the upload was prepared on.
+    async fn same_content_version(&self, target: UploadTarget<'_>) -> Result<Option<String>> {
+        let UploadTarget::Replace {
+            item_id,
+            base_hash: Some(base_hash),
+            ..
+        } = target
+        else {
+            return Ok(None);
+        };
+        let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}?$select=id,eTag,file");
+        let current: DriveItem = self.api.get_json(&url).await?;
+        Ok(match current.quick_xor_hash() == Some(base_hash) {
+            true => current.e_tag,
+            false => None,
+        })
+    }
+
     /// `client_id` is the Entra application (client) ID.
     pub fn new(client_id: String) -> Result<Self> {
         let auth = Authenticator::new(OAuthConfig {
@@ -83,15 +114,11 @@ impl Provider for OneDrive {
         })
     }
 
-    async fn changes(
-        &self,
-        cursor: Option<&str>,
-        progress: &ProgressCallback,
-    ) -> Result<ChangeSet> {
+    async fn changes(&self, cursor: Option<&str>, on_page: &PageCallback<'_>) -> Result<ChangeSet> {
         let (mut url, mut full) = match cursor {
             Some(link) => (link.to_owned(), false),
             None => (
-                format!("{GRAPH_BASE}/me/drive/root/delta?{DELTA_QUERY}"),
+                format!("{GRAPH_BASE}/me/drive/root/delta?{ITEM_QUERY}"),
                 true,
             ),
         };
@@ -99,8 +126,9 @@ impl Provider for OneDrive {
         loop {
             match delta::fetch_page(&self.api, &url).await? {
                 Page::Items { items, link } => {
+                    let fetched = changes.len();
                     changes.extend(items.into_iter().filter_map(|item| item.into_change()));
-                    progress(changes.len());
+                    on_page(&changes[fetched..]);
                     match link {
                         DeltaLink::Next(next) => url = next,
                         DeltaLink::Delta(cursor) => {
@@ -120,10 +148,34 @@ impl Provider for OneDrive {
                 }
                 Page::Resync { .. } => {
                     return Err(Error::Api {
-                        status: reqwest::StatusCode::GONE,
+                        status: StatusCode::GONE,
                         body: "the service rejected a fresh delta enumeration".to_owned(),
                     });
                 }
+            }
+        }
+    }
+
+    async fn top_level(&self) -> Result<Vec<RemoteItem>> {
+        let root: DriveItem = self
+            .api
+            .get_json(&format!("{GRAPH_BASE}/me/drive/root?{ITEM_QUERY}"))
+            .await?;
+        let mut items = vec![root.into_remote_item()?];
+        let mut url = format!("{GRAPH_BASE}/me/drive/root/children?{ITEM_QUERY}");
+        loop {
+            let page: Children = self.api.get_json(&url).await?;
+            items.extend(
+                page.value
+                    .into_iter()
+                    .filter_map(|item| match item.into_change() {
+                        Some(Change::Upsert(item)) => Some(item),
+                        _ => None,
+                    }),
+            );
+            match page.next_link {
+                Some(next) => url = next,
+                None => return Ok(items),
             }
         }
     }
@@ -135,5 +187,75 @@ impl Provider for OneDrive {
     async fn download(&self, item_id: &str, dest: &Path) -> Result<Downloaded> {
         let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}/content");
         self.api.download(&url, dest, self.hash_kind()).await
+    }
+
+    fn accepts_name(&self, name: &str) -> bool {
+        upload::accepts_name(name)
+    }
+
+    fn names_are_case_sensitive(&self) -> bool {
+        false
+    }
+
+    async fn upload(&self, target: UploadTarget<'_>, source: &Path) -> Result<RemoteItem> {
+        let uploaded = match upload::upload(&self.api, target, source).await {
+            // The version also moves when only metadata changes, sometimes
+            // by the service's own doing. Only different content counts.
+            Err(Error::Conflict) => match self.same_content_version(target).await? {
+                Some(version) => {
+                    let UploadTarget::Replace {
+                        item_id, base_hash, ..
+                    } = target
+                    else {
+                        return Err(Error::Conflict);
+                    };
+                    let retry = UploadTarget::Replace {
+                        item_id,
+                        base_version: Some(&version),
+                        base_hash,
+                    };
+                    upload::upload(&self.api, retry, source).await
+                }
+                None => Err(Error::Conflict),
+            },
+            other => other,
+        };
+        uploaded?.into_remote_item()
+    }
+
+    async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem> {
+        let url = format!("{GRAPH_BASE}/me/drive/items/{parent_id}/children");
+        let body = json!({
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        });
+        let response = self.api.send(|http| http.post(&url).json(&body)).await?;
+        read_json::<DriveItem>(response).await?.into_remote_item()
+    }
+
+    async fn move_item(
+        &self,
+        item_id: &str,
+        _from_parent_id: &str,
+        to_parent_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem> {
+        let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}");
+        let body = json!({ "name": name, "parentReference": { "id": to_parent_id } });
+        let response = self.api.send(|http| http.patch(&url).json(&body)).await?;
+        read_json::<DriveItem>(response).await?.into_remote_item()
+    }
+
+    async fn delete(&self, item_id: &str) -> Result<()> {
+        let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}");
+        let response = self.api.send(|http| http.delete(&url)).await?;
+        match response.status() {
+            status if status.is_success() || status == StatusCode::NOT_FOUND => Ok(()),
+            status => Err(Error::Api {
+                status,
+                body: response.text().await?,
+            }),
+        }
     }
 }

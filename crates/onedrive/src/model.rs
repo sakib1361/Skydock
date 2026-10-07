@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use skydock_core::{Change, RemoteItem};
+use skydock_core::{Change, Error, RemoteItem, Result};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +101,18 @@ impl DriveItem {
                 .file_system_info
                 .and_then(|info| info.last_modified_date_time),
         }))
+    }
+
+    /// The item a write returned. Unlike in delta, anything that is not a
+    /// placeable, existing item is an error here.
+    pub fn into_remote_item(self) -> Result<RemoteItem> {
+        match self.into_change() {
+            Some(Change::Upsert(item)) => Ok(item),
+            _ => Err(Error::Api {
+                status: reqwest::StatusCode::OK,
+                body: "the service did not describe the item it stored".to_owned(),
+            }),
+        }
     }
 }
 

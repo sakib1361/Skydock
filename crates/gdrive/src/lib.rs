@@ -5,17 +5,20 @@
 //! The start token is taken before listing so nothing that changes during
 //! the listing is missed.
 
+mod upload;
+
 use std::path::Path;
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use skydock_core::http::ApiClient;
+use serde_json::json;
+use skydock_core::http::{ApiClient, read_json};
 use skydock_core::oauth::{Authenticator, OAuthConfig};
 use skydock_core::{
-    Account, Change, ChangeSet, Downloaded, Error, HashKind, ProgressCallback, Provider,
-    ProviderKind, RemoteItem, Result, UrlCallback,
+    Account, Change, ChangeSet, Downloaded, Error, HashKind, PageCallback, Provider, ProviderKind,
+    RemoteItem, Result, UploadTarget, UrlCallback,
 };
 use url::Url;
 
@@ -58,32 +61,44 @@ impl GoogleDrive {
         self.api.get_json(url.as_str()).await
     }
 
+    /// A request that changes one file's metadata and returns the result.
+    async fn write(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        params: &[(&str, &str)],
+        body: serde_json::Value,
+    ) -> Result<RemoteItem> {
+        let mut params = params.to_vec();
+        params.push(("fields", FILE_FIELDS));
+        let url = Url::parse_with_params(&format!("{API}/{path}"), &params)
+            .expect("static API URL is valid");
+        let response = self
+            .api
+            .send(|http| http.request(method.clone(), url.as_str()).json(&body))
+            .await?;
+        read_json::<File>(response).await?.into_item()
+    }
+
     async fn root_id(&self) -> Result<String> {
         let root: File = self.get("files/root", &[("fields", "id")]).await?;
         Ok(root.id)
     }
 
-    async fn enumerate(&self, progress: &ProgressCallback) -> Result<ChangeSet> {
-        // Token first: changes made while we list are then replayed by the
-        // next incremental call instead of being lost.
-        let start: StartToken = self.get("changes/startPageToken", &[]).await?;
-        let root_id = self.root_id().await?;
-
-        let mut changes = vec![Change::Upsert(RemoteItem {
-            id: root_id.clone(),
-            parent_id: None,
-            name: "My Drive".to_owned(),
-            is_folder: true,
-            size: None,
-            version: None,
-            hash: None,
-            modified: None,
-        })];
+    /// Everything not in the bin that matches `query`, as upserts, handed
+    /// to `on_page` a page at a time.
+    async fn list(
+        &self,
+        query: &str,
+        root_id: &str,
+        changes: &mut Vec<Change>,
+        on_page: &PageCallback<'_>,
+    ) -> Result<()> {
         let fields = format!("nextPageToken,files({FILE_FIELDS})");
         let mut page_token: Option<String> = None;
         loop {
             let mut params = vec![
-                ("q", "trashed = false"),
+                ("q", query),
                 ("spaces", "drive"),
                 ("pageSize", PAGE_SIZE),
                 ("fields", fields.as_str()),
@@ -93,18 +108,31 @@ impl GoogleDrive {
             }
             let page: FileList = self.get("files", &params).await?;
             // Only items that sit in the tree; a full listing has no deletes.
+            let fetched = changes.len();
             changes.extend(
                 page.files
                     .into_iter()
-                    .map(|file| file.into_change(&root_id))
+                    .map(|file| file.into_change(root_id))
                     .filter(|change| matches!(change, Change::Upsert(_))),
             );
-            progress(changes.len());
+            on_page(&changes[fetched..]);
             match page.next_page_token {
                 Some(token) => page_token = Some(token),
-                None => break,
+                None => return Ok(()),
             }
         }
+    }
+
+    async fn enumerate(&self, on_page: &PageCallback<'_>) -> Result<ChangeSet> {
+        // Token first: changes made while we list are then replayed by the
+        // next incremental call instead of being lost.
+        let start: StartToken = self.get("changes/startPageToken", &[]).await?;
+        let root_id = self.root_id().await?;
+
+        let mut changes = vec![Change::Upsert(root_item(&root_id))];
+        on_page(&changes);
+        self.list("trashed = false", &root_id, &mut changes, on_page)
+            .await?;
         Ok(ChangeSet {
             changes,
             cursor: start.start_page_token,
@@ -112,7 +140,7 @@ impl GoogleDrive {
         })
     }
 
-    async fn changes_since(&self, cursor: &str, progress: &ProgressCallback) -> Result<ChangeSet> {
+    async fn changes_since(&self, cursor: &str, on_page: &PageCallback<'_>) -> Result<ChangeSet> {
         let root_id = self.root_id().await?;
         let fields =
             format!("nextPageToken,newStartPageToken,changes(fileId,removed,file({FILE_FIELDS}))");
@@ -130,12 +158,13 @@ impl GoogleDrive {
                     ],
                 )
                 .await?;
+            let fetched = changes.len();
             changes.extend(
                 page.changes
                     .into_iter()
                     .filter_map(|change| change.into_change(&root_id)),
             );
-            progress(changes.len());
+            on_page(&changes[fetched..]);
             match (page.next_page_token, page.new_start_page_token) {
                 (Some(next), _) => page_token = next,
                 (None, Some(cursor)) => {
@@ -196,22 +225,32 @@ impl Provider for GoogleDrive {
         })
     }
 
-    async fn changes(
-        &self,
-        cursor: Option<&str>,
-        progress: &ProgressCallback,
-    ) -> Result<ChangeSet> {
+    async fn changes(&self, cursor: Option<&str>, on_page: &PageCallback<'_>) -> Result<ChangeSet> {
         let Some(cursor) = cursor else {
-            return self.enumerate(progress).await;
+            return self.enumerate(on_page).await;
         };
-        match self.changes_since(cursor, progress).await {
+        match self.changes_since(cursor, on_page).await {
             // The token is too old or otherwise unusable: start over.
             Err(Error::Api {
                 status: StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::GONE,
                 ..
-            }) => self.enumerate(progress).await,
+            }) => self.enumerate(on_page).await,
             other => other,
         }
+    }
+
+    async fn top_level(&self) -> Result<Vec<RemoteItem>> {
+        let root_id = self.root_id().await?;
+        let mut changes = vec![Change::Upsert(root_item(&root_id))];
+        let query = format!("'{root_id}' in parents and trashed = false");
+        self.list(&query, &root_id, &mut changes, &|_| {}).await?;
+        Ok(changes
+            .into_iter()
+            .filter_map(|change| match change {
+                Change::Upsert(item) => Some(item),
+                Change::Delete { .. } => None,
+            })
+            .collect())
     }
 
     fn hash_kind(&self) -> HashKind {
@@ -222,6 +261,97 @@ impl Provider for GoogleDrive {
     async fn download(&self, item_id: &str, dest: &Path) -> Result<Downloaded> {
         let url = format!("{API}/files/{item_id}?alt=media");
         self.api.download(&url, dest, self.hash_kind()).await
+    }
+
+    fn accepts_name(&self, name: &str) -> bool {
+        !name.is_empty()
+    }
+
+    /// Google Drive even allows identical names side by side.
+    fn names_are_case_sensitive(&self) -> bool {
+        true
+    }
+
+    async fn upload(&self, target: UploadTarget<'_>, source: &Path) -> Result<RemoteItem> {
+        if let UploadTarget::Replace {
+            item_id,
+            base_version,
+            base_hash,
+        } = target
+        {
+            // The API has no conditional update, so look right before
+            // sending. A change in the moment between is not caught.
+            let current: File = self
+                .get(
+                    &format!("files/{item_id}"),
+                    &[("fields", "id,version,md5Checksum")],
+                )
+                .await?;
+            let same_version = base_version.is_some() && current.version.as_deref() == base_version;
+            let same_content = base_hash.is_some() && current.md5_checksum.as_deref() == base_hash;
+            if !same_version && !same_content {
+                return Err(Error::Conflict);
+            }
+        }
+        upload::upload(&self.api, target, source).await?.into_item()
+    }
+
+    async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem> {
+        let body = json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id] });
+        self.write(reqwest::Method::POST, "files", &[], body).await
+    }
+
+    async fn move_item(
+        &self,
+        item_id: &str,
+        from_parent_id: &str,
+        to_parent_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem> {
+        let parents = [
+            ("addParents", to_parent_id),
+            ("removeParents", from_parent_id),
+        ];
+        let params: &[_] = match from_parent_id == to_parent_id {
+            true => &[],
+            false => &parents,
+        };
+        let path = format!("files/{item_id}");
+        self.write(
+            reqwest::Method::PATCH,
+            &path,
+            params,
+            json!({ "name": name }),
+        )
+        .await
+    }
+
+    /// Moves the item to the bin rather than deleting it for good.
+    async fn delete(&self, item_id: &str) -> Result<()> {
+        let url = format!("{API}/files/{item_id}?fields=id");
+        let body = json!({ "trashed": true });
+        let response = self.api.send(|http| http.patch(&url).json(&body)).await?;
+        match response.status() {
+            status if status.is_success() || status == StatusCode::NOT_FOUND => Ok(()),
+            status => Err(Error::Api {
+                status,
+                body: response.text().await?,
+            }),
+        }
+    }
+}
+
+/// "My Drive" itself, which the listing calls do not return.
+fn root_item(root_id: &str) -> RemoteItem {
+    RemoteItem {
+        id: root_id.to_owned(),
+        parent_id: None,
+        name: "My Drive".to_owned(),
+        is_folder: true,
+        size: None,
+        version: None,
+        hash: None,
+        modified: None,
     }
 }
 
@@ -245,6 +375,17 @@ struct File {
 }
 
 impl File {
+    /// The file a write returned, which is never the root and never trashed.
+    fn into_item(self) -> Result<RemoteItem> {
+        match self.into_change("") {
+            Change::Upsert(item) => Ok(item),
+            Change::Delete { .. } => Err(Error::Api {
+                status: StatusCode::OK,
+                body: "the service did not describe the file it stored".to_owned(),
+            }),
+        }
+    }
+
     fn into_change(self, root_id: &str) -> Change {
         let is_root = self.id == root_id;
         let parent_id = self.parents.into_iter().next();

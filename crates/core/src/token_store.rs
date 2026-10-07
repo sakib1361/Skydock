@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::{ProviderKind, Result};
+
+const LOAD_ATTEMPTS: u32 = 4;
 
 /// Persists the refresh token in the desktop keyring (Secret Service, which
 /// KWallet provides on Plasma). The token never touches a plain file.
@@ -33,17 +36,29 @@ impl TokenStore {
     }
 
     pub async fn load(&self) -> Result<Option<String>> {
-        let items = Self::keyring()
-            .await?
-            .search_items(&self.attributes())
-            .await?;
-        let Some(item) = items.first() else {
-            return Ok(None);
-        };
-        let secret = item.secret().await?;
-        Ok(Some(
-            String::from_utf8_lossy(secret.as_bytes()).into_owned(),
-        ))
+        let keyring = Self::keyring().await?;
+        let mut attempt = 1;
+        loop {
+            let items = keyring.search_items(&self.attributes()).await?;
+            let Some(item) = items.first() else {
+                return Ok(None);
+            };
+            match item.secret().await {
+                Ok(secret) => {
+                    return Ok(Some(
+                        String::from_utf8_lossy(secret.as_bytes()).into_owned(),
+                    ));
+                }
+                // Saving replaces the entry, which gives it a new address.
+                // If another Skydock process saved between our search and
+                // this read, the entry we found is gone: look again.
+                Err(_) if attempt < LOAD_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     pub async fn save(&self, refresh_token: &str) -> Result<()> {

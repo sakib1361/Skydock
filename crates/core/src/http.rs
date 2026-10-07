@@ -3,10 +3,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use reqwest::header::RETRY_AFTER;
-use reqwest::{Response, StatusCode};
+use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::hash::{HashKind, Hasher};
 use crate::oauth::Authenticator;
@@ -36,13 +36,7 @@ impl ApiClient {
     }
 
     pub async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let response = self.get(url).await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(Error::Api { status, body });
-        }
-        Ok(serde_json::from_str(&body)?)
+        read_json(self.get(url).await?).await
     }
 
     /// Stream the body of an authenticated GET into `dest`, hashing it on
@@ -74,16 +68,52 @@ impl ApiClient {
     /// Authenticated GET. Handles throttling and one token refresh on 401;
     /// every other status is returned to the caller.
     pub async fn get(&self, url: &str) -> Result<Response> {
+        self.send(|http| http.get(url)).await
+    }
+
+    /// Any authenticated request, with the same handling as [`Self::get`].
+    /// `build` runs once per attempt.
+    pub async fn send(
+        &self,
+        build: impl Fn(&reqwest::Client) -> RequestBuilder,
+    ) -> Result<Response> {
+        self.dispatch(true, build).await
+    }
+
+    /// A request to a URL that carries its own authorisation, such as an
+    /// upload session. No `Authorization` header is added (providers reject
+    /// it there), but throttling is honoured like for any other request.
+    pub async fn send_preauthenticated(
+        &self,
+        build: impl Fn(&reqwest::Client) -> RequestBuilder,
+    ) -> Result<Response> {
+        self.dispatch(false, build).await
+    }
+
+    async fn dispatch(
+        &self,
+        authenticated: bool,
+        build: impl Fn(&reqwest::Client) -> RequestBuilder,
+    ) -> Result<Response> {
         let mut refreshed = false;
         let mut throttled = 0;
         loop {
             self.wait_for_pause().await;
-            let token = self.auth.access_token().await?;
-            let response =
-                send_with_retry(|| self.auth.http().get(url).bearer_auth(&token)).await?;
+            let token = match authenticated {
+                true => Some(self.auth.access_token().await?),
+                false => None,
+            };
+            let response = send_with_retry(|| {
+                let request = build(self.auth.http());
+                match &token {
+                    Some(token) => request.bearer_auth(token),
+                    None => request,
+                }
+            })
+            .await?;
 
             match response.status() {
-                StatusCode::UNAUTHORIZED if !refreshed => {
+                StatusCode::UNAUTHORIZED if authenticated && !refreshed => {
                     refreshed = true;
                     self.auth.invalidate().await;
                 }
@@ -122,6 +152,32 @@ impl ApiClient {
             }
         }
     }
+}
+
+/// The body of a successful response as JSON; any other status becomes
+/// [`Error::Api`] carrying the body as text.
+pub async fn read_json<T: DeserializeOwned>(response: Response) -> Result<T> {
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(Error::Api { status, body });
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// The next piece of a file being uploaded: `len` bytes, or fewer at the
+/// end of the file.
+pub async fn read_chunk(file: &mut tokio::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut chunk = vec![0; len];
+    let mut filled = 0;
+    while filled < len {
+        match file.read(&mut chunk[filled..]).await? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    chunk.truncate(filled);
+    Ok(chunk)
 }
 
 const NETWORK_ATTEMPTS: u32 = 3;

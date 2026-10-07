@@ -2,8 +2,10 @@
 //! browser redirects to a loopback listener. Shared by every provider; the
 //! provider supplies endpoints and scopes through [`OAuthConfig`].
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -62,7 +64,26 @@ pub struct Authenticator {
     http: reqwest::Client,
     config: OAuthConfig,
     store: TokenStore,
-    cached: Mutex<Option<AccessToken>>,
+    cached: Session,
+}
+
+/// The access token of one sign-in, and the lock that makes refreshing it
+/// one at a time.
+type Session = Arc<Mutex<Option<AccessToken>>>;
+
+/// One [`Session`] per provider and client for the whole process. Front
+/// ends create an authenticator per operation; if each kept its own token
+/// they would all refresh, and race each other on the keyring entry.
+fn shared_session(provider: ProviderKind, client_id: &str) -> Session {
+    static SESSIONS: OnceLock<std::sync::Mutex<HashMap<(ProviderKind, String), Session>>> =
+        OnceLock::new();
+    SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry((provider, client_id.to_owned()))
+        .or_default()
+        .clone()
 }
 
 impl Authenticator {
@@ -70,8 +91,8 @@ impl Authenticator {
         Ok(Self {
             http: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
             store: TokenStore::new(config.provider, config.client_id.clone()),
+            cached: shared_session(config.provider, &config.client_id),
             config,
-            cached: Mutex::new(None),
         })
     }
 

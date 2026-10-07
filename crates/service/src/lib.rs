@@ -7,7 +7,10 @@ mod settings;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use skydock_core::{Account, ProgressCallback, Provider, ProviderKind, UrlCallback};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use skydock_core::{Account, Change, ProgressCallback, Provider, ProviderKind, UrlCallback};
 use skydock_gdrive::GoogleDrive;
 use skydock_onedrive::OneDrive;
 use skydock_state::{Applied, Store, Totals};
@@ -173,16 +176,47 @@ impl Service {
             false => Store::open(&self.state_path)?.cursor(&key)?,
         };
 
-        let set = provider.changes(cursor.as_deref(), progress).await?;
+        // While a drive is read for the first time, show each batch as it
+        // arrives instead of nothing until the end. Later runs apply their
+        // changes in one piece, as change tracking requires.
+        let first_read = Store::open(&self.state_path)?.cursor(&key)?.is_none();
+        let preview = Mutex::new(Store::open(&self.state_path)?);
+        let received = AtomicUsize::new(0);
+        let on_page = |page: &[Change]| {
+            if first_read {
+                let items = page.iter().filter_map(|change| match change {
+                    Change::Upsert(item) => Some(item),
+                    Change::Delete { .. } => None,
+                });
+                // Only a preview: the finished set is applied regardless.
+                let _ = preview.lock().unwrap().put_many(&key, items);
+            }
+            progress(received.fetch_add(page.len(), Ordering::Relaxed) + page.len());
+        };
+        let set = provider.changes(cursor.as_deref(), &on_page).await?;
         let full = set.full;
 
-        let mut store = Store::open(&self.state_path)?;
+        let mut store = preview.into_inner().unwrap();
         let applied = store.apply(&key, set)?;
         Ok(PullReport {
             applied,
             full,
             totals: store.totals(&key)?,
         })
+    }
+
+    /// For a drive that has never been read in full: fetch just its top
+    /// folder, which takes a moment, so it can be mounted and browsed while
+    /// [`Self::pull`] reads the rest. Returns whether there is now something
+    /// to mount.
+    pub async fn pull_top_level(&self, kind: ProviderKind) -> Result<bool> {
+        let provider = self.provider(kind)?;
+        let key = self.account_key(kind, &*provider).await?;
+        if Store::open(&self.state_path)?.cursor(&key)?.is_none() {
+            let items = provider.top_level().await?;
+            Store::open(&self.state_path)?.put_many(&key, items.iter())?;
+        }
+        Ok(Store::open(&self.state_path)?.root(&key)?.is_some())
     }
 
     /// What the fetched file list holds at `path`: a folder's contents, or
@@ -288,7 +322,7 @@ impl Service {
     }
 
     /// Mount the provider's drive at its folder as files on demand. Needs
-    /// a fetched file list but no network; downloads run on `runtime`.
+    /// a fetched file list but no network; transfers run on `runtime`.
     pub async fn mount(
         &self,
         kind: ProviderKind,
@@ -296,13 +330,14 @@ impl Service {
     ) -> Result<Mount> {
         let provider: Arc<dyn Provider> = Arc::from(self.provider(kind)?);
         let key = self.account_key(kind, &*provider).await?;
-        let cache_dir = cache_dir(&key)?;
+        let (cache_dir, pending_dir) = (cache_dir(&key)?, pending_dir(&key)?);
         Ok(skydock_vfs::mount(
             provider,
             Store::open(&self.state_path)?,
             key,
             &self.provider_folder(kind),
             &cache_dir,
+            &pending_dir,
             runtime,
         )?)
     }
@@ -323,6 +358,16 @@ impl Service {
         Ok(match self.known_cache_dir(kind)? {
             Some(dir) => skydock_vfs::clear_cache(&dir),
             None => CacheUsage::default(),
+        })
+    }
+
+    /// How many of this provider's files have changes made on this device
+    /// that are not uploaded yet.
+    pub fn waiting_uploads(&self, kind: ProviderKind) -> Result<usize> {
+        let store = Store::open(&self.state_path)?;
+        Ok(match store.known_account(kind.id())? {
+            Some(account_id) => store.dirty(&format!("{}:{account_id}", kind.id()))?.len(),
+            None => 0,
         })
     }
 
@@ -356,5 +401,14 @@ fn cache_dir(account_key: &str) -> Result<PathBuf> {
     Ok(dirs::cache_dir()
         .ok_or(Error::NoUserDir("cache"))?
         .join("skydock")
+        .join(account_key.replace([':', '/'], "-")))
+}
+
+/// Where an account's changes wait until they are uploaded. Not under the
+/// cache directory: that may be emptied, and these exist nowhere else.
+fn pending_dir(account_key: &str) -> Result<PathBuf> {
+    Ok(dirs::data_dir()
+        .ok_or(Error::NoUserDir("data"))?
+        .join("skydock/pending")
         .join(account_key.replace([':', '/'], "-")))
 }

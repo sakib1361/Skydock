@@ -5162,6 +5162,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skydock-core",
+ "tokio",
  "url",
 ]
 
@@ -5187,6 +5188,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skydock-core",
+ "tokio",
 ]
 
 [[package]]
@@ -5220,6 +5222,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fuser",
+ "nix",
+ "reqwest",
  "sha2 0.11.0",
  "skydock-core",
  "skydock-state",

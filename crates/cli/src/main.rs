@@ -135,6 +135,8 @@ async fn main() -> Result<()> {
             );
         }
         Command::Mount { provider } => {
+            // Enough to show a drive that has never been read in full.
+            service.pull_top_level(provider).await?;
             let mount = service
                 .mount(provider, tokio::runtime::Handle::current())
                 .await?;

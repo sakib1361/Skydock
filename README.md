@@ -4,7 +4,7 @@ A cloud drive client for Linux. Skydock connects your OneDrive and Google Drive 
 
 It exists because Linux has no first-party OneDrive or Google Drive client, and the existing third-party ones tend to lack either files on demand, a desktop interface, or a simple `.deb` / AppImage install. Skydock is written in Rust, uses no Electron or Node.js, and runs without root.
 
-> **Early development.** Skydock shows your drives as read-only folders whose files download when you open them. It cannot upload or change anything in the cloud yet. See [Features](#features) for exactly what works.
+> **Early development.** Skydock shows your drives as folders whose files download when you open them and upload when you change them. Writing is new and has only been tested against a simulated drive, so keep a copy of anything important. See [Features](#features) for exactly what works.
 
 Not affiliated with or endorsed by Microsoft or Google. OneDrive and Google Drive are trademarks of their respective owners.
 
@@ -15,8 +15,11 @@ Not affiliated with or endorsed by Microsoft or Google. OneDrive and Google Driv
 - **OneDrive** (personal Microsoft accounts) and **Google Drive** (My Drive).
 - **Browser sign-in.** You sign in on the provider's own page; Skydock never sees your password.
 - **Sessions in the desktop keyring** (KWallet, GNOME Keyring), never in a plain file.
-- **Change tracking.** The first run reads the whole drive's file list into a local database; later runs fetch only what changed.
+- **Change tracking.** The first run reads the whole drive's file list into a local database; later runs fetch only what changed. The drive's folder is usable within seconds of signing in: the top level appears first and the rest fills in while the first read continues.
 - **Files on demand.** Each drive appears as a folder with every file at its real size, using no disk space. A file downloads the first time you open it and is checked against the provider's own hash; after that it opens instantly.
+- **Changes go back to the cloud.** Create, edit, rename, move and delete files and folders in a drive's folder with any application. New and edited files upload a moment after they are closed; folders, renames and deletions happen at once. Deleted items go to the provider's recycle bin.
+- **Nothing is overwritten by surprise.** If a file was also changed somewhere else, the other version stays and yours is uploaded beside it as `name (conflicted copy from <computer>)`.
+- **Works through interruptions.** Edits made without a connection are kept on this device and uploaded when Skydock next can, including after a restart.
 - **Stays current.** While the window or tray icon is running, drives are checked for changes every five minutes, or as often as you choose in Settings.
 - **See and reclaim space.** Each drive shows how many files are downloaded to this device and how much room they take; Settings can free that space without deleting anything from the cloud.
 - **Desktop window** showing each account, how much storage it uses, and how many files Skydock knows about, plus a **tray icon**.
@@ -26,7 +29,6 @@ Not affiliated with or endorsed by Microsoft or Google. OneDrive and Google Driv
 
 ### Planned
 
-- Writing: creating, editing, renaming and deleting files, uploaded to the cloud, with conflict handling.
 - "Always keep on this device" and "Free up space".
 - A background service, so the folders are there without the window running.
 - File-manager integration for KDE Dolphin (status icons, right-click actions), then other desktops.
@@ -35,7 +37,13 @@ Not affiliated with or endorsed by Microsoft or Google. OneDrive and Google Driv
 ### Limits to know about
 
 - OneDrive work and school accounts are not supported.
-- The folders are read-only for now, and exist only while Skydock is running.
+- The folders exist only while Skydock is running.
+- Creating folders, renaming, moving and deleting need a connection; without one they fail. Only new and edited files wait for the connection to return.
+- Uploaded files get the time of the upload as their modification time, not the one the application set.
+- Lock, swap and backup files that applications keep beside a document (`.~lock.*#`, `*.swp`, `*~`, `*.tmp`, `*.part` and similar) stay on this device and are not uploaded.
+- OneDrive does not allow some names (`"*:<>?\|`, a trailing dot or space, names such as `CON`); creating such a file fails with "Invalid argument" instead of being renamed.
+- "Move to wastebasket" in a file manager is refused inside a drive; use Delete, which moves the item to the provider's recycle bin.
+- An upload restarts from the beginning if it is interrupted.
 - Google Docs, Sheets and Slides are listed as empty files that cannot be opened.
 - On Ubuntu the sync folder must be inside your home folder, or under `/mnt` or `/media`; the system refuses on-demand folders elsewhere (for example on drives mounted under `/run/media`).
 - Files that are only shared with you (not added to your own drive) are not included.
@@ -75,7 +83,20 @@ You choose one sync folder; it defaults to your home directory. Each provider ge
 
 ## Install
 
-There are no published releases yet. Check [Supported systems](#supported-systems), then build from source:
+Check [Supported systems](#supported-systems), then download the latest `.deb` or AppImage from the [releases page](https://github.com/sakib1361/Skydock/releases/latest).
+
+```sh
+# Debian, Ubuntu and derivatives
+sudo apt install ./skydock_*.deb
+
+# anywhere else: fuse3 must be installed
+chmod +x Skydock-*.AppImage
+./Skydock-*.AppImage
+```
+
+Each release includes a `SHA256SUMS` file; `sha256sum -c --ignore-missing SHA256SUMS` in the download folder checks the files against it.
+
+Or build from source:
 
 ```sh
 sudo apt install build-essential pkg-config libsqlite3-dev libfontconfig-dev fuse3
@@ -92,7 +113,7 @@ sudo apt install ./out/skydock_*.deb
 
 ## Configure the provider client IDs
 
-Skydock needs to be registered as an application with Microsoft and with Google before either will let it start a sign-in. The registration gives a **client ID**, which identifies the app, not you. Release builds will include these; until then, anyone building Skydock creates their own. Each takes about ten minutes and is free.
+Skydock needs to be registered as an application with Microsoft and with Google before either will let it start a sign-in. The registration gives a **client ID**, which identifies the app, not you. Release builds include these, so this section only applies when building Skydock yourself. Each takes about ten minutes and is free.
 
 Menu names in both consoles change from time to time, so the wording below may differ slightly from what you see.
 
@@ -174,7 +195,7 @@ cargo run -p skydock-gui        # or `skydock-gui` once installed
 
 - **Sign in** opens your browser. After you approve, Skydock reads your file list and the drive appears in its folder.
 - **Check for changes** asks the drive what changed since the last check. It also happens automatically; no file content is downloaded by it.
-- **Open folder** opens that provider's local folder.
+- **Open folder** opens that provider's local folder. Work in it as in any other folder; each drive's card shows how many files are still waiting to upload.
 - **Settings** holds the sync folder, how often to check for changes, and **Free up space**.
 - Closing the window keeps Skydock in the tray; use **Quit** in the tray menu to exit.
 
@@ -200,6 +221,7 @@ From a source checkout, prefix with `cargo run -p skydock-cli --`.
 | Settings | `~/.config/skydock/config.toml` |
 | File list database (names and sizes, no content) | `~/.local/share/skydock/state.sqlite` |
 | Content of files you have opened | `~/.cache/skydock/` |
+| New and edited files not uploaded yet | `~/.local/share/skydock/pending/` |
 | Sign-in sessions | Desktop keyring |
 
 ## Development
@@ -211,6 +233,8 @@ cargo clippy --all-targets
 cargo fmt
 ```
 
+The `skydock-vfs` tests mount a real folder under the system's temporary directory in front of a simulated drive, so they need `fusermount3` (package `fuse3`); without it they are skipped. No test talks to OneDrive or Google Drive.
+
 In VS Code, `Ctrl+Shift+B` runs the window; other tasks are under **Tasks: Run Task**. `F5` debugging needs the CodeLLDB extension.
 
 ### Project layout
@@ -219,8 +243,8 @@ In VS Code, `Ctrl+Shift+B` runs the window; other tasks are under **Tasks: Run T
 |---|---|
 | `crates/core` | The `Provider` trait, provider-neutral item and change types, shared sign-in, keyring storage and HTTP |
 | `crates/onedrive`, `crates/gdrive` | One crate per provider |
-| `crates/state` | SQLite database of remote file metadata |
-| `crates/vfs` | The on-demand filesystem (FUSE) and its content cache |
+| `crates/state` | SQLite database of remote file metadata and of files waiting to upload |
+| `crates/vfs` | The on-demand filesystem (FUSE), its content cache, and the uploads of what changes |
 | `crates/service` | Settings and the operations every front end calls |
 | `crates/cli`, `crates/gui` | Command-line tool and window |
 

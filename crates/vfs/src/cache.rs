@@ -125,13 +125,24 @@ impl Cache {
 impl Cache {
     /// Drop cached content of earlier versions of `item`. Anyone still
     /// reading one keeps their open file; only the name goes away.
-    fn remove_older_copies(&self, item: &Item, current: &Path) {
-        let prefix = format!("{}-", item_part(&item.id));
+    pub(crate) fn remove_older_copies(&self, item: &Item, current: &Path) {
+        self.remove_copies(&item.id, Some(current));
+    }
+
+    /// Drop every cached version of an item that no longer exists.
+    pub(crate) fn remove_all_copies(&self, item_id: &str) {
+        self.remove_copies(item_id, None);
+    }
+
+    fn remove_copies(&self, item_id: &str, keep: Option<&Path>) {
+        let prefix = format!("{}-", item_part(item_id));
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
         for entry in entries.flatten() {
-            if entry.path() != current && entry.file_name().to_string_lossy().starts_with(&prefix) {
+            if Some(entry.path().as_path()) != keep
+                && entry.file_name().to_string_lossy().starts_with(&prefix)
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -140,7 +151,7 @@ impl Cache {
 
 const PARTIAL_SUFFIX: &str = ".partial";
 
-fn item_part(id: &str) -> String {
+pub(crate) fn item_part(id: &str) -> String {
     hex_digest(id)[..32].to_owned()
 }
 
@@ -209,7 +220,8 @@ mod tests {
 
     use async_trait::async_trait;
     use skydock_core::{
-        Account, ChangeSet, Downloaded, HashKind, ProgressCallback, ProviderKind, UrlCallback,
+        Account, ChangeSet, Downloaded, HashKind, PageCallback, ProviderKind, RemoteItem,
+        UploadTarget, UrlCallback,
     };
 
     use super::*;
@@ -241,8 +253,11 @@ mod tests {
         async fn changes(
             &self,
             _: Option<&str>,
-            _: &ProgressCallback,
+            _: &PageCallback<'_>,
         ) -> skydock_core::Result<ChangeSet> {
+            unimplemented!()
+        }
+        async fn top_level(&self) -> skydock_core::Result<Vec<RemoteItem>> {
             unimplemented!()
         }
         fn hash_kind(&self) -> HashKind {
@@ -256,6 +271,30 @@ mod tests {
                 bytes: self.content.len() as u64,
                 hash: self.reported_hash.to_owned(),
             })
+        }
+        fn accepts_name(&self, _: &str) -> bool {
+            unimplemented!()
+        }
+        fn names_are_case_sensitive(&self) -> bool {
+            unimplemented!()
+        }
+        async fn upload(&self, _: UploadTarget<'_>, _: &Path) -> skydock_core::Result<RemoteItem> {
+            unimplemented!()
+        }
+        async fn create_folder(&self, _: &str, _: &str) -> skydock_core::Result<RemoteItem> {
+            unimplemented!()
+        }
+        async fn move_item(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> skydock_core::Result<RemoteItem> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &str) -> skydock_core::Result<()> {
+            unimplemented!()
         }
     }
 

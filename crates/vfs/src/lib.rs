@@ -1,8 +1,13 @@
-//! Files on demand: mounts one account's drive as a read-only folder whose
-//! files download when first opened.
+//! Files on demand: mounts one account's drive as a folder whose files
+//! download when first opened and upload after they are changed.
 
 mod cache;
 mod fs;
+mod names;
+mod pending;
+#[cfg(test)]
+mod tests;
+mod upload;
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -59,13 +64,16 @@ impl Mount {
 }
 
 /// Mount `account`'s drive at `mountpoint`. `store` must be a connection of
-/// its own; downloads run on `runtime` and land in `cache_dir`.
+/// its own; transfers run on `runtime`. Downloads land in `cache_dir`, which
+/// may be emptied at any time; changes not uploaded yet are kept in
+/// `pending_dir`, which must not be.
 pub fn mount(
     provider: Arc<dyn Provider>,
     store: Store,
     account: String,
     mountpoint: &Path,
     cache_dir: &Path,
+    pending_dir: &Path,
     runtime: Handle,
 ) -> Result<Mount, MountError> {
     let io = |source| MountError::Io {
@@ -76,6 +84,7 @@ pub fn mount(
     prepare_mountpoint(mountpoint)?;
     let owner = std::fs::metadata(mountpoint).map_err(io)?;
     let cache = cache::Cache::new(cache_dir).map_err(io)?;
+    let pending = pending::Pending::new(pending_dir).map_err(io)?;
 
     let filesystem = fs::SkydockFs::new(
         account,
@@ -83,12 +92,14 @@ pub fn mount(
         &root,
         Arc::clone(&provider),
         cache,
+        pending,
         runtime,
         (owner.uid(), owner.gid()),
     );
+    filesystem.inner().resume_uploads()?;
     let mut config = fuser::Config::default();
     config.mount_options = vec![
-        MountOption::RO,
+        MountOption::RW,
         MountOption::FSName("skydock".to_owned()),
         MountOption::Subtype(provider.kind().id().to_owned()),
         MountOption::DefaultPermissions,
@@ -141,7 +152,7 @@ fn prepare_mountpoint(mountpoint: &Path) -> Result<(), MountError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod mountpoint_tests {
     use super::*;
 
     #[test]

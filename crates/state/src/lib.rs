@@ -6,6 +6,8 @@
 //! or moved folder, so a stored path would silently go stale.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use skydock_core::{Change, ChangeSet, RemoteItem, latest_per_item};
@@ -26,7 +28,7 @@ pub enum Error {
 
 /// One entry per schema version; a database at version N has had the first
 /// N applied. Only ever append.
-const MIGRATIONS: [&str; 2] = [SCHEMA, KNOWN_ACCOUNTS];
+const MIGRATIONS: [&str; 3] = [SCHEMA, KNOWN_ACCOUNTS, LOCAL_CHANGES];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -60,6 +62,41 @@ CREATE TABLE providers (
     account_id TEXT NOT NULL
 ) WITHOUT ROWID;
 ";
+
+/// Files whose content was changed on this device and not uploaded yet.
+/// The base columns describe the remote content the change started from;
+/// both are NULL for a file the provider has never seen.
+const LOCAL_CHANGES: &str = "
+CREATE TABLE dirty (
+    account      TEXT NOT NULL,
+    id           TEXT NOT NULL,
+    base_version TEXT,
+    base_hash    TEXT,
+    PRIMARY KEY (account, id)
+) WITHOUT ROWID;
+";
+
+/// Start of the ID given to a file created on this device until its first
+/// upload, when the provider's own ID replaces it.
+const LOCAL_ID_PREFIX: &str = "local-";
+
+/// Whether `id` belongs to a file the provider has never seen.
+pub fn is_local_id(id: &str) -> bool {
+    id.starts_with(LOCAL_ID_PREFIX)
+}
+
+/// An ID for a file created on this device.
+pub fn new_local_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "{LOCAL_ID_PREFIX}{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// What applying one change set altered.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -101,6 +138,24 @@ fn read_item(row: &rusqlite::Row) -> rusqlite::Result<Item> {
         version: row.get(4)?,
         hash: row.get(5)?,
         modified: row.get(6)?,
+    })
+}
+
+/// A file with content changes waiting to be uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dirty {
+    pub id: String,
+    /// Version and hash of the remote content the change started from;
+    /// `None` for a file the provider has never seen.
+    pub base_version: Option<String>,
+    pub base_hash: Option<String>,
+}
+
+fn read_dirty(row: &rusqlite::Row) -> rusqlite::Result<Dirty> {
+    Ok(Dirty {
+        id: row.get(0)?,
+        base_version: row.get(1)?,
+        base_hash: row.get(2)?,
     })
 }
 
@@ -199,6 +254,9 @@ impl Store {
                 // until the whole set is in.
                 Change::Delete { id } => match is_folder(&tx, account, &id)? {
                     None => {}
+                    // Deleted remotely, changed here: the local change
+                    // survives and its upload puts the file back.
+                    Some(false) if is_dirty(&tx, account, &id)? => {}
                     Some(true) => deleted_folders.push(id),
                     Some(false) => applied.deleted += delete(&tx, account, &id)?,
                 },
@@ -213,10 +271,12 @@ impl Store {
         }
 
         // A full enumeration lists everything, so whatever it did not
-        // mention no longer exists remotely.
+        // mention no longer exists remotely. Files waiting to be uploaded
+        // are the exception: the provider may never have heard of them.
         if set.full {
             applied.deleted += tx.execute(
-                "DELETE FROM items WHERE account = ?1 AND id NOT IN (SELECT id FROM seen)",
+                "DELETE FROM items WHERE account = ?1 AND id NOT IN (SELECT id FROM seen)
+                 AND id NOT IN (SELECT id FROM dirty WHERE account = ?1)",
                 [account],
             )?;
         }
@@ -264,6 +324,131 @@ impl Store {
             },
         )?;
         Ok(totals)
+    }
+
+    /// Store one item as the provider (or, for a file not uploaded yet,
+    /// this device) describes it, outside any change set.
+    pub fn put(&self, account: &str, item: &RemoteItem) -> Result<()> {
+        upsert(&self.conn, account, item)
+    }
+
+    /// Store items ahead of the change set they belong to, so a drive can
+    /// be browsed while its first enumeration is still running. Nothing is
+    /// removed and no cursor is recorded; the finished set settles both.
+    pub fn put_many<'a>(
+        &mut self,
+        account: &str,
+        items: impl Iterator<Item = &'a RemoteItem>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for item in items {
+            upsert(&tx, account, item)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forget an item and any local change recorded for it.
+    pub fn remove(&mut self, account: &str, id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        delete(&tx, account, id)?;
+        tx.execute(
+            "DELETE FROM dirty WHERE account = ?1 AND id = ?2",
+            [account, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record the outcome of an upload: `item` takes the place of
+    /// `previous_id`, which differs from its ID when the file had not been
+    /// uploaded before. With `still_dirty` the file stays marked as changed
+    /// (it was written to again meanwhile), now based on what was uploaded.
+    pub fn replace(
+        &mut self,
+        account: &str,
+        previous_id: &str,
+        item: &RemoteItem,
+        still_dirty: bool,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        if previous_id != item.id {
+            delete(&tx, account, previous_id)?;
+        }
+        tx.execute(
+            "DELETE FROM dirty WHERE account = ?1 AND id IN (?2, ?3)",
+            [account, previous_id, &item.id],
+        )?;
+        upsert(&tx, account, item)?;
+        if still_dirty {
+            tx.execute(
+                "INSERT INTO dirty (account, id, base_version, base_hash) VALUES (?1, ?2, ?3, ?4)",
+                params![account, item.id, item.version, item.hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Note that a file has content changes waiting to be uploaded, made on
+    /// top of the remote content `base` describes (`None` for a file the
+    /// provider has never seen). An earlier note for the same file is kept.
+    pub fn mark_dirty(&self, account: &str, id: &str, base: Option<&Item>) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO dirty (account, id, base_version, base_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                account,
+                id,
+                base.and_then(|item| item.version.as_deref()),
+                base.and_then(|item| item.hash.as_deref()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_dirty(&self, account: &str, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM dirty WHERE account = ?1 AND id = ?2",
+            [account, id],
+        )?;
+        Ok(())
+    }
+
+    /// Files with changes waiting to be uploaded.
+    pub fn dirty(&self, account: &str) -> Result<Vec<Dirty>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT id, base_version, base_hash FROM dirty WHERE account = ?1 ORDER BY id",
+        )?;
+        let dirty = statement
+            .query_map([account], read_dirty)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(dirty)
+    }
+
+    /// The waiting change recorded for one file, if any.
+    pub fn dirty_entry(&self, account: &str, id: &str) -> Result<Option<Dirty>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, base_version, base_hash FROM dirty WHERE account = ?1 AND id = ?2",
+                [account, id],
+                read_dirty,
+            )
+            .optional()?)
+    }
+
+    /// The folder an item is in; `None` for the root or an unknown item.
+    pub fn parent_id(&self, account: &str, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT parent_id FROM items WHERE account = ?1 AND id = ?2",
+                [account, id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Contents of a folder, folders first, then by name.
@@ -364,6 +549,14 @@ fn is_folder(tx: &Transaction, account: &str, id: &str) -> Result<Option<bool>> 
         .optional()?)
 }
 
+fn is_dirty(tx: &Transaction, account: &str, id: &str) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM dirty WHERE account = ?1 AND id = ?2)",
+        [account, id],
+        |row| row.get(0),
+    )?)
+}
+
 fn has_children(tx: &Transaction, account: &str, id: &str) -> Result<bool> {
     Ok(tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM items WHERE account = ?1 AND parent_id = ?2)",
@@ -379,8 +572,8 @@ fn delete(tx: &Transaction, account: &str, id: &str) -> Result<usize> {
     )?)
 }
 
-fn upsert(tx: &Transaction, account: &str, item: &RemoteItem) -> Result<()> {
-    tx.execute(
+fn upsert(conn: &Connection, account: &str, item: &RemoteItem) -> Result<()> {
+    conn.execute(
         "INSERT INTO items (account, id, parent_id, name, is_folder, size, version, hash, modified)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (account, id) DO UPDATE SET
@@ -643,6 +836,88 @@ mod tests {
             .map(|item| item.name)
             .collect();
         assert_eq!(names, ["Docs", "b.txt"], "folders come first");
+    }
+
+    fn versioned(id: &str, name: &str, version: &str, hash: &str) -> RemoteItem {
+        RemoteItem {
+            id: id.to_owned(),
+            parent_id: Some("root".to_owned()),
+            name: name.to_owned(),
+            is_folder: false,
+            size: Some(5),
+            version: Some(version.to_owned()),
+            hash: Some(hash.to_owned()),
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn files_waiting_for_upload_survive_remote_deletes_and_full_resyncs() {
+        let mut store = seeded();
+        let created = RemoteItem {
+            id: new_local_id(),
+            ..versioned("", "new.txt", "", "")
+        };
+        assert!(is_local_id(&created.id) && !is_local_id("f1"));
+        store.put(DRIVE, &created).unwrap();
+        store.mark_dirty(DRIVE, &created.id, None).unwrap();
+        let f2 = store.item(DRIVE, "f2").unwrap().unwrap();
+        store.mark_dirty(DRIVE, "f2", Some(&f2)).unwrap();
+
+        store
+            .apply(DRIVE, set(vec![deleted("f2")], "link-2", false))
+            .unwrap();
+        let applied = store
+            .apply(DRIVE, set(vec![root()], "link-3", true))
+            .unwrap();
+
+        assert_eq!(applied.deleted, 3, "only the clean items went");
+        assert!(store.item(DRIVE, "f2").unwrap().is_some());
+        assert!(store.item(DRIVE, &created.id).unwrap().is_some());
+        assert_eq!(store.dirty(DRIVE).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn upload_result_replaces_the_local_item() {
+        let mut store = seeded();
+        let local = RemoteItem {
+            id: new_local_id(),
+            ..versioned("", "new.txt", "", "")
+        };
+        store.put(DRIVE, &local).unwrap();
+        store.mark_dirty(DRIVE, &local.id, None).unwrap();
+
+        let uploaded = versioned("f9", "new.txt", "v1", "h1");
+        store.replace(DRIVE, &local.id, &uploaded, false).unwrap();
+        assert_eq!(store.item(DRIVE, &local.id).unwrap(), None);
+        assert_eq!(
+            store.path(DRIVE, "f9").unwrap().as_deref(),
+            Some("/new.txt")
+        );
+        assert_eq!(
+            store.parent_id(DRIVE, "f9").unwrap().as_deref(),
+            Some("root")
+        );
+        assert_eq!(store.dirty(DRIVE).unwrap(), []);
+
+        // Written to again during the upload: still waiting, on the new base.
+        let first = store.item(DRIVE, "f9").unwrap().unwrap();
+        store.mark_dirty(DRIVE, "f9", Some(&first)).unwrap();
+        let again = versioned("f9", "new.txt", "v2", "h2");
+        store.mark_dirty(DRIVE, "f9", None).unwrap();
+        let noted = store.dirty_entry(DRIVE, "f9").unwrap().unwrap();
+        assert_eq!(noted.base_hash.as_deref(), Some("h1"), "first note is kept");
+
+        store.replace(DRIVE, "f9", &again, true).unwrap();
+        let noted = store.dirty_entry(DRIVE, "f9").unwrap().unwrap();
+        assert_eq!(
+            (noted.base_version.as_deref(), noted.base_hash.as_deref()),
+            (Some("v2"), Some("h2"))
+        );
+
+        store.remove(DRIVE, "f9").unwrap();
+        assert_eq!(store.item(DRIVE, "f9").unwrap(), None);
+        assert_eq!(store.dirty(DRIVE).unwrap(), []);
     }
 
     #[test]
