@@ -5127,7 +5127,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5138,7 +5138,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -5155,7 +5155,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-gdrive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -5168,7 +5168,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libm",
  "rfd",
@@ -5181,7 +5181,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-onedrive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -5193,7 +5193,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "serde",
@@ -5209,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-state"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
  "skydock-core",
@@ -5218,7 +5218,7 @@ dependencies = [
 
 [[package]]
 name = "skydock-vfs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "fuser",
